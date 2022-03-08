@@ -4,12 +4,14 @@ from torch import Tensor
 from torch.utils.data import Dataset, DataLoader
 import torch.nn.functional as F
 from torch import optim
+from torch.utils.tensorboard import SummaryWriter
 
 import numpy as np
 import pandas as pd
 from scipy import stats
 import math
 import random
+from ushuffle import shuffle
 
 from sklearn import metrics
 
@@ -19,9 +21,12 @@ class TranscriptsDataset(Dataset):
     def __init__(self, data, max_seq_len):
         self.seq = data.seq.to_list()
         self.is_exon = data.is_exon.to_list()
+        # self.label = data.is_exprs.to_list()
         self.n = data.total_reads.to_list()
         self.k_s = data.xlr.to_list()
         self.tr_id = data.index.to_list()
+        self.gene_id = data.gene_id.to_list()
+        # self.gene_len = data.len.to_list()
         self.max_seq_len = max_seq_len
 
     def __len__(self):
@@ -59,14 +64,29 @@ class TranscriptsDataset(Dataset):
     def __getitem__(self, idx):
         
         seq = self.seq[idx]
+        is_exon = self.is_exon[idx]
+        
+        rand_seq = shuffle(bytes(seq, 'utf-8'), 1).decode('utf-8')
+        rand_is_exon = shuffle(bytes(is_exon, 'utf-8'), 1).decode('utf-8')
+        
+        ## True Seq.
         seq = self._pad_seq(seq, self.max_seq_len)
         seq = self._get_seq_1h(seq)
-        is_exon = self.is_exon[idx]
         is_exon = self._pad_is_exon(is_exon, self.max_seq_len)
         is_exon = self._get_is_exon_1h(is_exon)
-        
         seq = np.row_stack((seq, is_exon))
         seq = torch.from_numpy(seq)    
+        
+        ## Random Seq.
+        rand_seq = self._pad_seq(rand_seq, self.max_seq_len)
+        rand_seq = self._get_seq_1h(rand_seq)
+        rand_is_exon = self._pad_is_exon(rand_is_exon, self.max_seq_len)
+        rand_is_exon = self._get_is_exon_1h(rand_is_exon)
+        rand_seq = np.row_stack((rand_seq, rand_is_exon))
+        rand_seq = torch.from_numpy(rand_seq)
+        
+        # label = self.label[idx]
+        # torch.tensor(label, dtype = torch.float32)
         
         n = self.n[idx]
         n = torch.tensor([n], dtype = torch.float32)
@@ -75,8 +95,9 @@ class TranscriptsDataset(Dataset):
         k_s = torch.tensor([k_s], dtype = torch.float32)
 
         tr_id = self.tr_id[idx]
+        gene_id = self.gene_id[idx]
 
-        return seq, n, k_s, tr_id
+        return seq, rand_seq, n, k_s, tr_id, gene_id
 
 def PrepareDatasets(data_path,
                     train_frac, val_frac,
@@ -176,7 +197,13 @@ class Trainer(nn.Module):
         self.mode = self.param_vals.get('mode', 'regression')
         self.train_losses, self.valid_losses, self.train_eval_metric_1, self.valid_eval_metric_1, self.train_eval_metric_2, self.valid_eval_metric_2 = [], [], [], [], [], []
         
+        self.tr_epoch_df, self.val_epoch_df = pd.DataFrame(), pd.DataFrame()
+        self.tr_cor, self.tr_cor_thres, self.tr_cor_gene, self.tr_kl_gene = [], [], [], []
+        self.val_cor, self.val_cor_thres, self.val_cor_gene, self.val_kl_gene = [], [], [], []
+        self.tr_rand_cor, self.tr_rand_diff, self.val_rand_cor, self.val_rand_diff = [], [], [], []
+        
         self.device = self.model.device
+        self.writer = SummaryWriter()
         
         num_targets = self.param_vals.get('num_targets', 1)
         if isinstance(num_targets, list): 
@@ -292,13 +319,15 @@ class Trainer(nn.Module):
         '''
         print('began training')
         for epoch in range(self.param_vals.get('num_epochs', 10)):
+            self.model.train()
+            self.tr_epoch_df = pd.DataFrame()
             train_loader, val_loader, _ = self.make_loaders()
             print(len(train_loader), len(val_loader))
             for batch_idx, batch in enumerate(train_loader):
                 print_res, plot_res = False, False
-                self.model.train()
-                x, n, k_s, _ = batch
-                x, n, k_s = x.to(self.device), n.to(self.device), k_s.to(self.device)
+
+                x, rand_x, n, k_s, tr_id, gene_id = batch
+                x, rand_x, n, k_s = x.to(self.device), rand_x.to(self.device), n.to(self.device), k_s.to(self.device)
                 if (debug): 
                     print (x.shape, n.shape, k_s.shape)
                 if x.shape[0] != 1: 
@@ -307,23 +336,24 @@ class Trainer(nn.Module):
                         print_res = True
                         if batch_idx%300==0:
                             plot_res = True
-                    self.train_step(x, n, k_s, print_res, plot_res, epoch, batch_idx, train_loader)
+                    self.train_step(x, rand_x, n, k_s, tr_id, gene_id, print_res, plot_res, epoch, batch_idx, train_loader)
                     print_res, plot_res = False, False
 #             print(self.train_R2)
                              
             if val_loader:
+                self.val_epoch_df = pd.DataFrame()
                 print_res, plot_res = False, False
                 self.model.eval()
                 for batch_idx, batch in enumerate(val_loader):
                     print_res, plot_res = False, False 
-                    x, n, k_s, _ = batch
-                    x, n, k_s = x.to(self.device), n.to(self.device), k_s.to(self.device)
+                    x, rand_x, n, k_s, tr_id, gene_id = batch
+                    x, rand_x, n, k_s = x.to(self.device), rand_x.to(self.device), n.to(self.device), k_s.to(self.device)
                     if x.shape[0] != 1: 
                         if batch_idx%10==0:
                             print_res = True
                             if batch_idx%300==0:
                                 plot_res = True
-                        self.eval_step(x, n, k_s, print_res, plot_res, epoch, batch_idx, val_loader) 
+                        self.eval_step(x, rand_x, n, k_s, tr_id, gene_id, print_res, plot_res, epoch, batch_idx, val_loader) 
                         print_res, plot_res = False, False 
 
             train_arrs = np.array([self.train_losses, self.train_eval_metric_1, self.train_eval_metric_2])
@@ -331,8 +361,45 @@ class Trainer(nn.Module):
             self.plot_metrics(epoch+1, train_arrs, val_arrs)
             if self.num_targets > 1: 
                 self.plot_ind_loss(epoch+1, self.train_losses_ind)
+                
+            epoch_df_colnames = {0: 'gene_id', 1: 'tr_id', 2: 'n', 3: 'k_s', 4: 'p_true', 5: 'p_pred', 6: 'p_rand'}
+            self.tr_epoch_df.rename(epoch_df_colnames, axis=1, inplace=True)
+            self.val_epoch_df.rename(epoch_df_colnames, axis=1, inplace=True)
+            
+            n_thres = self.param_vals.get('n_thres', 5)
+            
+            self.tr_cor.append(stats.spearmanr(self.tr_epoch_df[['p_true', 'p_pred']])[0])
+            self.tr_cor_thres.append(stats.spearmanr(self.tr_epoch_df[self.tr_epoch_df.n >= n_thres][['p_true', 'p_pred']])[0])
+            # self.tr_cor_gene.append(self.tr_epoch_df[self.tr_epoch_df.n >= n_thres].groupby('gene_id').apply(lambda x: stats.spearmanr(x[['p_true', 'p_pred']])[0]).mean())
+            # self.tr_kl_gene.append(self.tr_epoch_df[self.tr_epoch_df.n >= n_thres].groupby('gene_id').apply(lambda x: stats.entropy(x[['p_true', 'p_pred']])).mean())
+            tr_cor_gene_ = self.tr_epoch_df[self.tr_epoch_df.n >= n_thres].groupby(['gene_id', 'n']).apply(lambda x: stats.spearmanr(x[['p_true', 'p_pred']])[0]).reset_index().rename({0: 'cor'}, axis=1).dropna()
+            self.tr_cor_gene.append(np.average(tr_cor_gene_.cor, weights=tr_cor_gene_.n))
+            tr_kl_gene_ = self.tr_epoch_df[self.tr_epoch_df.n >= n_thres].groupby(['gene_id', 'n']).apply(lambda x: stats.entropy(x[['p_true', 'p_pred']])).reset_index().rename({0: 'kl'}, axis=1).dropna()
+            self.tr_kl_gene.append(np.average(tr_kl_gene_.kl, weights=tr_kl_gene_.n))
+                        
+            self.val_cor.append(stats.spearmanr(self.val_epoch_df[['p_true', 'p_pred']])[0])
+            self.val_cor_thres.append(stats.spearmanr(self.val_epoch_df[self.val_epoch_df.n >= n_thres][['p_true', 'p_pred']])[0])
+            # self.val_cor_gene.append(self.val_epoch_df[self.val_epoch_df.n >= n_thres].groupby('gene_id').apply(lambda x: stats.spearmanr(x[['p_true', 'p_pred']])[0]).mean())
+            # self.val_kl_gene.append(self.val_epoch_df[self.val_epoch_df.n >= n_thres].groupby('gene_id').apply(lambda x: stats.entropy(x[['p_true', 'p_pred']])).mean())                       
+            val_cor_gene_ = self.val_epoch_df[self.val_epoch_df.n >= n_thres].groupby(['gene_id', 'n']).apply(lambda x: stats.spearmanr(x[['p_true', 'p_pred']])[0]).reset_index().rename({0: 'cor'}, axis=1).dropna()
+            self.val_cor_gene.append(np.average(val_cor_gene_.cor, weights=val_cor_gene_.n))
+            val_kl_gene_ = self.val_epoch_df[self.val_epoch_df.n >= n_thres].groupby(['gene_id', 'n']).apply(lambda x: stats.entropy(x[['p_true', 'p_pred']])).reset_index().rename({0: 'kl'}, axis=1).dropna()
+            self.val_kl_gene.append(np.average(val_kl_gene_.kl, weights=val_kl_gene_.n))
 
-    def train_step(self, x, n, k_s, print_res, plot_res, epoch, batch_idx, train_loader):
+            self.tr_rand_cor.append(stats.spearmanr(self.tr_epoch_df[['p_rand', 'p_pred']])[0])
+            self.val_rand_cor.append(stats.spearmanr(self.val_epoch_df[['p_rand', 'p_pred']])[0])
+            self.tr_rand_diff.append((self.tr_epoch_df.p_pred - self.tr_epoch_df.p_rand).abs().mean())
+            self.val_rand_diff.append((self.val_epoch_df.p_pred - self.val_epoch_df.p_rand).abs().mean())
+            
+            self.plot_metrics_within_gene(epoch+1)
+            
+            if(self.param_vals.get('save_results', False)):
+                if epoch%10==0:
+                    print(f'Saving model on epoch {epoch}')
+                    self.save_model(self.model, f'data/model/Basenji_{self.model.max_seq_len}_ep{epoch}.pt')
+         
+
+    def train_step(self, x, rand_x, n, k_s, tr_id, gene_id, print_res, plot_res, epoch, batch_idx, train_loader):
         '''
         Define each training step
         '''
@@ -342,10 +409,14 @@ class Trainer(nn.Module):
             out = self.model(x).view(y.shape)
             p = torch.sigmoid(out.detach())
             
+            out_rand = self.model(rand_x).view(y.shape)
+            p_rand = torch.sigmoid(out_rand.detach())
+            
             loss = 0
             # calculate loss for each target
             for i in range(y.shape[-1]):
                 # loss_ = self.loss_fn(p[:, i], n[:, i], k_s[:, i])
+                # loss_ = self.loss_fn(out[:, i], y[:, i], weight=n[:, i])
                 loss_ = F.binary_cross_entropy_with_logits(out[:, i], y[:, i], weight=n[:, i])
                 self.train_losses_ind[i].append(loss_.data.item())
                 loss += loss_
@@ -381,7 +452,15 @@ class Trainer(nn.Module):
             self.train_eval_metric_1.append(Rp)
             self.train_eval_metric_2.append(R2)
             
-
+        n_ = n.detach().clone().flatten().cpu().tolist()
+        k_s_ = k_s.detach().clone().flatten().cpu().tolist()
+        p_true = y.detach().clone().flatten().cpu().tolist()
+        p_pred = p.detach().clone().flatten().cpu().tolist()
+        p_rand = p_rand.detach().clone().flatten().cpu().tolist()
+        
+        batch_df = pd.DataFrame(zip(gene_id, tr_id, n_, k_s_, p_true, p_pred, p_rand))
+        self.tr_epoch_df = pd.concat([self.tr_epoch_df, batch_df], ignore_index=True)
+            
         if print_res: 
             if self.mode == 'classification':
                 print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}\tPres: {:.6f}\tF1 Score: {:.6f}'.format(
@@ -394,22 +473,31 @@ class Trainer(nn.Module):
         if plot_res: 
             print (torch.sum(y).item(), torch.sum(p).item())
             self.plot_results(y, p, self.num_targets)
+            
+            
+        self.writer.add_scalar('Loss/Train', loss, f'{epoch}_{batch_idx}')
 
-    def eval_step(self, x, n, k_s, print_res, plot_res, epoch, batch_idx, val_loader):
+    def eval_step(self, x, rand_x, n, k_s, tr_id, gene_id, print_res, plot_res, epoch, batch_idx, val_loader):
         '''
         Define each evaluation step
         '''
         y = k_s / n
         out = self.model(x).view(y.shape)
         p = torch.sigmoid(out.detach())
+        # p = self.model(x).view(y.shape)
+        
+        out_rand = self.model(rand_x).view(y.shape)
+        p_rand = torch.sigmoid(out_rand.detach())
 
         loss = 0
         for i in range(y.shape[-1]):
             # loss_ = self.loss_fn(p[:, i], n[:, i], k_s[:, i])
+            # loss_ = self.loss_fn(out[:, i], y[:, i], weight=n[:, i])
             loss_ = F.binary_cross_entropy_with_logits(out[:, i], y[:, i], weight=n[:, i])
 
             loss += loss_
 
+#         loss = self.loss_fn(out,y)
         if self.mode == 'classification': 
             # calculate the precision and f1 score for classification
             pres, f1 = self.calc_pres_f1(y, out)
@@ -425,7 +513,15 @@ class Trainer(nn.Module):
         else: 
             self.valid_eval_metric_1.append(Rp)
             self.valid_eval_metric_2.append(R2)                
-                            
+        
+        n_ = n.detach().clone().flatten().cpu().tolist()
+        k_s_ = k_s.detach().clone().flatten().cpu().tolist()
+        p_true = y.detach().clone().flatten().cpu().tolist()
+        p_pred = p.detach().clone().flatten().cpu().tolist()
+        p_rand = p_rand.detach().clone().flatten().cpu().tolist()
+        
+        batch_df = pd.DataFrame(zip(gene_id, tr_id, n_, k_s_, p_true, p_pred, p_rand))
+        self.val_epoch_df = pd.concat([self.val_epoch_df, batch_df], ignore_index=True)
 
         if print_res: 
             if self.mode == 'classification':
@@ -448,12 +544,50 @@ class Trainer(nn.Module):
             
     def plot_metrics(self, num_epochs, train_arrs, val_arrs): 
         fig, axs = plt.subplots(nrows=1, ncols=3, figsize=(20, 6))
+        titles = ['CELoss', 'PCor', 'RSquared']
         for i in range(3):
             mean_train_arr = self.mean_arr(num_epochs, train_arrs[i])
             mean_val_arr = self.mean_arr(num_epochs, val_arrs[i])
             axs[i].plot(np.arange(num_epochs-1), mean_train_arr[1:], label='Train')
             axs[i].plot(np.arange(num_epochs-1), mean_val_arr[1:], label='Val')
+            axs[i].set_title(titles[i])
         fig.tight_layout()
+        if(self.param_vals.get('save_results', False)):
+            if num_epochs%10 == 0:
+                plt.savefig(f'data/plots/Basenji_{self.param_vals.get("max_seq_len")}_ep{num_epochs}.png')
+        plt.show()
+        
+    def plot_metrics_within_gene(self, num_epochs):
+        fig, axs = plt.subplots(nrows=2, ncols=4, figsize=(20, 6))
+        
+        axs[0, 0].plot(np.arange(num_epochs), self.tr_cor, label='Train')
+        axs[0, 0].plot(np.arange(num_epochs), self.val_cor, label='Val')
+        axs[0, 0].set_title('SpCor')
+        
+        axs[0, 1].plot(np.arange(num_epochs), self.tr_cor_thres, label='Train')
+        axs[0, 1].plot(np.arange(num_epochs), self.val_cor_thres, label='Val')
+        axs[0, 1].set_title('SpCorNThres')
+        
+        axs[0, 2].plot(np.arange(num_epochs), self.tr_cor_gene, label='Train')
+        axs[0, 2].plot(np.arange(num_epochs), self.val_cor_gene, label='Val')
+        axs[0, 2].set_title('SpCorWithinGene')
+        
+        axs[0, 3].plot(np.arange(num_epochs), self.tr_kl_gene, label='Train')
+        axs[0, 3].plot(np.arange(num_epochs), self.val_kl_gene, label='Val')
+        axs[0, 3].set_title('KLWithinGene')
+        
+        axs[1, 0].plot(np.arange(num_epochs), self.tr_rand_cor, label='Train')
+        axs[1, 0].plot(np.arange(num_epochs), self.val_rand_cor, label='Val')
+        axs[1, 0].set_title('SpCorPredVSRand')
+
+        axs[1, 1].plot(np.arange(num_epochs), self.tr_rand_diff, label='Train')
+        axs[1, 1].plot(np.arange(num_epochs), self.val_rand_diff, label='Val')
+        axs[1, 1].set_title('DiffPredVSRand')
+
+        fig.tight_layout()
+        if self.param_vals.get('save_results', False):
+            if num_epochs%10 == 0:
+                plt.savefig(f'data/plots/Basenji_{self.param_vals.get("max_seq_len")}_ep{num_epochs}_within_gene.png')
         plt.show()    
         
     def plot_ind_loss(self, num_epochs, train_arrs_ind):
