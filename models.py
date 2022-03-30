@@ -155,3 +155,94 @@ class Basenji(nn.Module):
         self.to(device)
         self.device = device
 
+
+class SplicingCodeWithDilation(nn.Module):
+    def __init__(self, max_seq_len=2**15):
+        super().__init__()
+        
+        self.device = 'cpu'
+        self.max_seq_len = max_seq_len
+        
+        self.conv_block1 = nn.Sequential(
+            nn.Conv1d(5, 32, 8, padding = 'same'),
+            nn.LeakyReLU(),
+            nn.BatchNorm1d(32),
+            nn.MaxPool1d(2, 2),
+            nn.Dropout(0.25))
+       
+        self.conv_block2 = nn.Sequential(
+            nn.Conv1d(32, 64, 8, padding = 'same'),
+            nn.LeakyReLU(),
+            nn.BatchNorm1d(64),
+            nn.MaxPool1d(2, 2),
+            nn.Dropout(0.25))
+                
+        self.conv_block3 = nn.Sequential(
+            nn.Conv1d(64, 128, 8, padding = 'same'),
+            nn.LeakyReLU(),
+            nn.BatchNorm1d(128),
+            nn.MaxPool1d(4, 4),
+            nn.Dropout(0.25))
+        
+        self.conv_block4 = nn.Sequential(
+            nn.Conv1d(128, 256, 8, padding = 'same'),
+            nn.LeakyReLU(),
+            nn.BatchNorm1d(256),
+            nn.MaxPool1d(4, 4),
+            nn.Dropout(0.25))
+        
+        self.d2_conv_block = nn.Sequential(
+            nn.Conv1d(256, 256, 8, padding = 'same', dilation=2),
+            nn.LeakyReLU(),
+            nn.BatchNorm1d(256),
+            nn.MaxPool1d(4, 4),
+            nn.Dropout(0.125))
+        
+        self.d4_conv_block = nn.Sequential(
+            nn.Conv1d(256, 128, 8, padding = 'same', dilation=4),
+            nn.LeakyReLU(),
+            nn.BatchNorm1d(128),
+            nn.MaxPool1d(4, 4),
+            nn.Dropout(0.25))
+        
+        self.d8_conv_block = nn.Sequential(
+            nn.Conv1d(128, 64, 8, padding = 'same', dilation=8),
+            nn.LeakyReLU(),
+            nn.BatchNorm1d(64),
+            nn.MaxPool1d(4, 4),
+            nn.Dropout(0.5))
+        
+        self.conv_block_final = nn.Sequential(
+            nn.Conv1d(64, 32, 8, padding = 'same'),
+            nn.LeakyReLU(),
+            nn.BatchNorm1d(32),
+            nn.MaxPool1d(4, 4),
+            nn.Dropout(0.25))
+
+        self.classify = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(32 * 2, 16),
+            nn.ReLU(),
+            nn.Dropout(0.25),
+            nn.Linear(16, 1),
+            # nn.Sigmoid() ## Not need if using *CEWithLogitsLoss
+        )
+        
+        
+    def forward(self, input):
+        
+        x = self.conv_block1(input)
+        x = self.conv_block2(x)
+        x = self.conv_block3(x)
+        x = self.conv_block4(x)
+        x = self.d2_conv_block(x)
+        x = self.d4_conv_block(x)
+        x = self.d8_conv_block(x)
+        x = self.conv_block_final(x)
+        latent = self.classify(x)
+        
+        return latent
+    
+    def compile(self, device='cpu'):
+        self.to(device)
+        self.device = device

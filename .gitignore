@@ -1,4 +1,6 @@
 data/*
 runs/*
+bak/*
+debug/*
 __pycache__
 .ipynb_checkpoints
